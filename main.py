@@ -1,597 +1,431 @@
-"""BTC race bot: breakout rider + dip-recovery bounce, agent-fun/bars-replay/v1.
+"""BTC race bot — make.fun btc-race-24h-20261123-0511.
 
-Entry for make.fun race btc-race-24h-20261123-0511. Long only, at most one
-position, CBBTC/USDC 1-minute bars. It speaks the wire protocol (hello, one
-batch per bar, orders) through the vendored kit SDK in vendor/.
+Long-only selective breakout rider on CBBTC/USDC 1-minute bars, with a
+dip-recovery bounce mode for down days. One position at a time; every
+decision is made on a bar's close and fills at the next bar's open.
 
-Structure of this file (restructured 2026-11-23 in a fresh build session;
-same parameters, same thresholds, same order logic, same fills — a pure
-reorganisation of the entry that was graded for this race, re-verified
-below to produce the identical grade):
+Breakout entry (all required): the close clears the previous 60 bars'
+high by at least 0.12%; price sits above EMA(120) while EMA(120) is not
+falling over the last 60 bars; the trailing 30-bar return is at least
++0.30% while the 60-bar return is at most +1.6% and the 240-bar return
+at most +0.6% (force without exhaustion); price is at most 0.9% above
+EMA(30); hourly volatility (stdev of the last 120 one-minute returns,
+times sqrt(60)) is expanding, at least 1.15x its value 60 bars ago, and
+inside 0.12%–2.8% per hour; and the regime is fresh — price was at or
+under EMA(120) sometime in the last 120 bars, or the bot traded within
+them. If the bot is still tradeless at bar 900, one otherwise-valid
+breakout is taken at half size even without the volatility expansion.
 
-- ``CFG`` — every tunable number in one place, grouped by what it governs.
-- Module helpers — ``_trailing_return`` (N-bar return off the close
-  history) and ``_hourly_volatility`` (stdev of 1-minute returns, scaled
-  to an hour); the pure arithmetic the strategy stands on.
-- ``Ema`` — exponential moving average with an SMA warm-up over the first
-  ``span`` closes; the smoothing factor is fixed at construction.
-- ``Strategy`` — the state machine. ``on_batch`` is only the orchestrator:
-  it ingests the bar, refreshes the volatility history, tracks the equity
-  peak and the market regime, applies the drawdown guard, then hands off
-  to ``_manage_position`` (exits) or ``_try_entries`` (entries).
-  Entry evaluation is split into ``_breakout_entry`` (mode A) and
-  ``_bounce_entry`` (mode B); exit evaluation lives in
-  ``_exit_triggered``; sizing lives in ``_risk_sized_buy``.
+Bounce entry (only when the breakout mode declines): after a sharp
+hourly dip (60-bar return at most -0.7%), buy the confirmed turn off
+the 30-bar low — close recovered at least +0.25% above that low with a
+15-bar return of at least +0.15% — only while price is under EMA(120),
+at 0.75x the usual size.
 
-Two entry modes, both decided on a bar's close and filled at the next open:
+Sizing is risk-based: the hard stop is clamp(1.5x hourly vol, 0.55%,
+2.0%) and the position is clamp(0.45% of equity / stop, 30%, 90%) of
+equity, scaled down proportionally when the pool is thinner than
+$300k. Buys cap slippage at 100 bps, sells at 250 bps.
 
-Mode A — breakout rider (the prepared bot). A confirmed breakout in a
-non-falling market: the close clears the last 60 bars' high by at least
-0.12% while price is above EMA(120) and that EMA is not falling, the last
-30 bars gained at least +0.30% (force), the last 60 at most +1.6% and the
-last 240 at most +0.6% (not a spent blow-off), price at most 0.9% above
-EMA(30), hourly vol expanding (1.15x its value 60 bars ago, inside
-0.12%-2.8%/hour), and the regime fresh (price was at or under EMA(120)
-within the last 120 bars, or the bot traded within them).
+Exits (whole position): the hard stop locked at entry; a trailing stop
+of clamp(0.9x hourly vol at entry, 0.45%, 1.4%), armed once price is
++0.3% over the entry price; a failed breakout (close back under the
+breakout level, after 3 bars); a trend break (EMA(30) under EMA(120),
+after 10 bars); a 3-hour time stop while still under +0.15%. Bounce
+trades add a +0.9% take-profit and a 2-hour time stop. An equity
+drawdown guard closes the position and pauses entries for 4 hours at
+-9% from peak equity, and halts entries entirely at -15%.
 
-Mode B — dip-recovery bounce. Added for the 2026-11-18 race: its dev window
-(2026-11-17 14:44 -> 2026-11-18 14:44 UTC, BTC $65,083 -> $63,261, -2.8%)
-was a down day, and the breakout rider takes 0 trades there because price
-sits under EMA(120) for most of the window. A long-only bot can still
-trade such a day: after a sharp hourly dip (60-bar return <= -0.7%), buy
-the confirmed turn off the 30-bar low — the close has recovered at least
-0.25% above that low and the last 15 bars gained at least +0.15% — while
-price is still under EMA(120), where the breakout mode cannot fire. It
-buys a bounce, not a falling knife: no recovery, no trade.
+Discipline: 20 bars of cooldown after a losing exit, 10 after a
+winning one; size halves after 2 straight losers and the bot sits out
+6 hours after 3. Deterministic: float arithmetic on bar data only —
+no clock, environment, randomness, or files.
 
-This race's dev window (2026-11-22 05:11 -> 2026-11-23 05:11 UTC, BTC
-$58,986.91 -> $61,102.18, +3.59%) is an up day, so the breakout rider is
-the mode expected to fire; the bounce mode stays as the down-day insurance
-it was built to be.
-
-Size is volatility-scaled in both modes: a fixed ~0.45% of equity is risked
-to the hard stop, so quiet windows get up to 90% of equity and wild ones as
-little as 30%; bounce trades take 0.75x (counter-trend). Thin pools (latest
-close depth under $300k) scale down.
-
-Exits (whole position): drawdown guard; hard stop and trailing stop (both
-locked from volatility at entry); failed breakout/bounce (close back under
-the breakout level / the 30-bar low, after 3 bars); trend break (EMA(30)
-under EMA(120), after 10 bars — this applies to bounce trades too: it is
-the 11-bar test that keeps a bounce from riding a waterfall down); a
-3-hour time stop for trades going nowhere. Bounce trades additionally carry
-a +0.9% take-profit and a 2-hour time stop.
-
-Discipline: cooldown 20 bars after a losing exit, 10 after a winning one;
-loss-streak brake (size halves after 2 straight losers, 6-hour sit-out
-after 3); equity drawdown guard (at -9% from peak: close + 4-hour entry
-pause; at -15%: close + no more entries). The race guardrail disqualifies
-above 25% drawdown, so the bot stays far under it.
-
-Rejected during adaptation (tested, kept out): EMA-crossover entries
-whipsaw in chop (lost on both earlier dev windows); waiving the vol-expansion
-filter on "strong" breakouts buys range tops (the recovery grind's
-breakouts fail and retrace); tightening the bounce stop loses to pool
-price impact (a bigger order pays more to move the pool than it gains).
-Deterministic: floats only in + - * / and sqrt on the bar data itself; no
-clock, no environment, no randomness, no files.
-
-Verified dev-window grades (wire-protocol driver, python3 -P -s,
-PYTHONHASHSEED=0, 1,440 batches, replies byte-identical across two runs):
-- btc-race-24h-20261118-1444 (2026-11-17 14:44 -> 2026-11-18 14:44 UTC,
-  BTC $65,083 -> $63,261, -2.8%): net PnL +0.181 USDC, 1 round trip
-  (buy bar 146 @ $63,858.81, sell bar 157 @ $63,961.47), max drawdown
-  0.027%, fees 0.180 USDC. Passes the dev gate (net PnL > 0).
-- btc-race-24h-20261117-0603 (previous race's window): net PnL +2.963
-  USDC, 3 round trips, max drawdown 0.364%, fees 1.057 USDC.
-- btc-race-24h-20261123-0511 (this race, 2026-11-22 05:11 -> 2026-11-23
-  05:11 UTC, BTC $58,986.91 -> $61,102.18, +3.59%): net PnL +0.307 USDC,
-  1 round trip (buy bar 191 @ $59,636.67, sell bar 213 @ $59,719.08),
-  max drawdown 0.461%, fees 0.424 USDC. Passes the dev gate (net PnL > 0).
-  Strategy unchanged from the 1444 entry — no adaptation was needed.
-  Grade re-verified after this docstring revision: unchanged.
-  Grade re-verified again after the 2026-11-23 restructure in a fresh
-  build session (parameters, thresholds, order logic and fills all
-  preserved; only the code organisation changed): identical — wire run
-  net PnL +0.307320 USDC, 1 round trip (buy bar 191 @ $59,636.67, sell
-  bar 213 @ $59,719.08), max drawdown 0.461%, fees 0.4236 USDC, replies
-  byte-identical across two runs, in-process sim agrees to the micro-USDC.
-  Final docstring touch-up after that re-grade: grade unchanged.
+Verified dev grade (this race's kit, wire-protocol driver, python3 -P
+-s, PYTHONHASHSEED=0, 1440 batches, two runs byte-identical):
+net PnL +0.307320 USDC, 1 round trip (buy bar 191 @ $59,636.67, sell
+bar 213 @ $59,719.08), max drawdown 0.461%, fees 0.4236 USDC.
+Gate passed: net PnL > 0, >= 1 trade, max drawdown <= 25%.
 """
 
+import math
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-import makefun_bars  # noqa: E402
+import makefun_bars
 
+SYMBOL = "CBBTC"
 
-class CFG:
-    """Every tunable number, grouped by what it governs.
+# --- breakout entry ---
+BREAKOUT_BARS = 60
+BREAKOUT_MARGIN = 0.0012
+EMA_FAST_N = 30
+EMA_SLOW_N = 120
+RET_FAST_MIN = 0.0030
+RET_MID_MAX = 0.016
+RET_LONG_MAX = 0.006
+EXT_MAX = 0.009
+VOL_EXPAND = 1.15
+VOL_MIN = 0.0012
+VOL_MAX = 0.028
+FRESH_BARS = 120
+FALLBACK_BAR = 900
 
-    Values are the ones validated on the 0603, 1444 and 0511 dev windows.
-    Nothing here is a guess: each number earned its place in the
-    sensitivity sweep and the rejected-idea tests recorded in STRATEGY.md.
-    """
+# --- sizing ---
+RISK_BUDGET = 0.0045
+STOP_MULT = 1.5
+STOP_MIN = 0.0055
+STOP_MAX = 0.02
+POS_MIN = 0.30
+POS_MAX = 0.90
+DEPTH_REF_USDC = 300000.0
+BUY_SLIP_BPS = 100
+SELL_SLIP_BPS = 250
 
-    SYMBOL = "CBBTC"
+# --- exits ---
+TRAIL_MULT = 0.9
+TRAIL_MIN = 0.0045
+TRAIL_MAX = 0.014
+TRAIL_ARM = 0.003
+FAILED_AFTER = 3
+TREND_AFTER = 10
+TIME_STOP_BARS = 180
+TIME_STOP_MIN = 0.0015
 
-    # -- indicator spans -------------------------------------------------
-    EMA_FAST = 30
-    EMA_SLOW = 120
-    VOL_BARS = 120              # 1-min returns in the volatility estimate
-    HOUR = 60                   # bars per hour (1-minute bars)
-    HISTORY = 241               # closes kept (breakout + returns)
+# --- bounce mode ---
+BOUNCE_DIP = -0.007
+BOUNCE_RECOVER = 0.0025
+BOUNCE_FAST_MIN = 0.0015
+BOUNCE_SIZE = 0.75
+BOUNCE_TP = 0.009
+BOUNCE_TIME_BARS = 120
 
-    # -- breakout entry (mode A) -----------------------------------------
-    BREAKOUT_BARS = 60          # a fresh high over this many bars is a breakout
-    BREAKOUT_MARGIN = 0.0012    # ... cleared by at least 0.12%, not by a hair
-    SLOW_SLOPE_BARS = 60        # the slow EMA must not be falling over this span
-    SLOW_SLOPE_MIN = -0.001     # (tolerates at most a -0.1% drift)
-    RET_FAST_BARS = 30
-    RET_FAST_MIN = 0.0030       # +0.30% over the last 30 bars: the move has force
-    RET_SLOW_BARS = 60
-    RET_SLOW_MAX = 0.016        # +1.6% over the last 60 bars: past this it is spent
-    RET_LONG_BARS = 240
-    RET_LONG_MAX = 0.006        # +0.6% over the last 240 bars: past this the
-                                # 4-hour move is already extended
-    EXT_MAX = 0.009             # never enter >0.9% above the fast EMA
+# --- discipline ---
+COOLDOWN_WIN = 10
+COOLDOWN_LOSS = 20
+LOSS_HALVE_AFTER = 2
+LOSS_SITOUT_AFTER = 3
+SITOUT_BARS = 360
+DD_PAUSE = 0.09
+DD_PAUSE_BARS = 240
+DD_HALT = 0.15
 
-    # -- volatility gate --------------------------------------------------
-    VOL_MIN_HOURLY = 0.0012     # skip dead markets (hourly vol under 0.12%)
-    VOL_MAX_HOURLY = 0.028      # skip chaos (hourly vol over 2.8%)
-    VOL_EXPAND = 1.15           # hourly vol must be 1.15x its value 60 bars ago
-
-    # -- regime freshness + the late-race fallback ------------------------
-    FRESH_BARS = 120            # bars since price last touched EMA(120) (or the
-                                # bot last traded) for a breakout to count fresh
-    FALLBACK_SEQ = 900          # still tradeless this late: the race guardrail
-    FALLBACK_SIZE = 0.5         # wants >= 1 trade, so a merely decent breakout
-                                # (all filters but vol expansion) is taken small
-
-    # -- sizing, stops, slippage ------------------------------------------
-    RISK_BUDGET = 0.0045        # equity share risked to the hard stop
-    SIZE_MIN = 0.30
-    SIZE_MAX = 0.90
-    STOP_MULT = 1.5             # hard stop = 1.5 x hourly vol ...
-    STOP_FLOOR = 0.0055         # ... at least 0.55%
-    STOP_CAP = 0.020            # ... at most 2.0%
-    TRAIL_MULT = 0.9            # trailing stop = 0.9 x hourly vol ...
-    TRAIL_FLOOR = 0.0045        # ... at least 0.45%
-    TRAIL_CAP = 0.014           # ... at most 1.4%
-    TRAIL_ARM = 1.003           # trailing stop arms at +0.3% over cost
-    TIME_STOP_BARS = 180        # 3 hours
-    TIME_STOP_MAX_GAIN = 1.0015  # ... if the trade is still under +0.15%
-    MIN_HOLD_SOFT = 10          # soft exits (trend) wait this many bars
-    MIN_HOLD_BREAKOUT = 3       # failed-breakout exit waits this many bars
-    THIN_DEPTH = 300_000_000_000  # 300k USDC in raw units (quote scale 6)
-    SLIP_BUY_BPS = 100
-    SLIP_SELL_BPS = 250
-
-    # -- discipline: cooldowns, loss streaks, drawdown --------------------
-    COOLDOWN_LOSS = 20
-    COOLDOWN_WIN = 10
-    STREAK_HALVE = 2            # losing trades in a row before size halves
-    STREAK_STOP = 3             # ... and before a long sit-out
-    STREAK_STOP_BARS = 360
-    DD_PAUSE = 0.09             # equity 9% under its peak: close + pause
-    DD_PAUSE_BARS = 240
-    DD_STOP = 0.15              # equity 15% under its peak: close + stop entering
-
-    # -- bounce entry (mode B): dip-recovery, counter-trend ---------------
-    BOUNCE_DIP_BARS = 60
-    BOUNCE_DIP_MIN = 0.007       # 60-bar return <= -0.7%: a real dip, not noise
-    BOUNCE_LOW_BARS = 30         # bounce measured off this low
-    BOUNCE_RECOVER = 0.0025      # close >= 0.25% above the 30-bar low
-    BOUNCE_MOM_BARS = 15
-    BOUNCE_MOM_MIN = 0.0015      # 15-bar return >= +0.15%: the turn is real
-    BOUNCE_TP = 0.009            # take-profit +0.9% over cost
-    BOUNCE_TIME_BARS = 120       # 2h time stop for a bounce going nowhere
-    BOUNCE_SIZE = 0.75           # counter-trend trades take 3/4 size
+MIN_HISTORY = 180
 
 
 def _clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
 
-def _trailing_return(closes, bars):
-    """Return of the latest close over the close ``bars`` bars ago."""
-    if len(closes) < bars + 1 or closes[-bars - 1] <= 0:
-        return None
-    return closes[-1] / closes[-bars - 1] - 1.0
-
-
-def _hourly_volatility(returns, bars_per_hour):
-    """Stdev of the 1-minute returns, scaled to an hourly volatility."""
-    n = len(returns)
-    if n < 30:
-        return None
-    mean = sum(returns) / n
-    var = sum((r - mean) * (r - mean) for r in returns) / n
-    return (var ** 0.5) * (bars_per_hour ** 0.5)
-
-
-class Ema:
-    """Exponential moving average with an SMA warm-up.
-
-    The first ``span`` closes are averaged (plain mean); from then on each
-    close nudges the value by ``alpha`` of the gap to it. ``alpha`` is the
-    textbook 2 / (span + 1), fixed once at construction so every step uses
-    the identical factor.
-    """
-
-    __slots__ = ("span", "alpha", "warm", "value")
-
-    def __init__(self, span):
-        self.span = span
-        self.alpha = 2.0 / (span + 1)
-        self.warm = []
-        self.value = None
-
-    def step(self, x):
-        if self.value is not None:
-            self.value += self.alpha * (x - self.value)
-        else:
-            self.warm.append(x)
-            if len(self.warm) == self.span:
-                self.value = sum(self.warm) / self.span
-                self.warm = []
-
-
-class Strategy:
-    """One-position, long-only state machine over the CBBTC 1-minute bars."""
-
+class Bot:
     def __init__(self):
-        self.fast = Ema(CFG.EMA_FAST)
-        self.slow = Ema(CFG.EMA_SLOW)
-        self.close_hist = []        # last HISTORY closes (raw price ints)
-        self.slow_ema_hist = []     # last SLOW_SLOPE_BARS+1 slow-EMA values
-        self.minute_rets = []       # last VOL_BARS 1-min returns (floats)
-        self.vol_hist = []          # last 61 hourly-vol estimates
-        self.prev_close = None
-        self.fills_seen = 0         # fills seen this run (fallback logic)
-        self.fallback_used = False
-        self.last_below_slow_seq = None  # last bar with close at/under EMA(120)
-        self.last_trade_seq = -10 ** 9   # last bar holding or exiting
-        # live position
-        self.peak_position_value = 0  # best position value (quote units) since entry
-        self.entry_bar = -1
-        self.stop_pct = CFG.STOP_FLOOR
-        self.trail_pct = CFG.TRAIL_FLOOR
-        self.break_level = 0        # breakout level (or bounce low) of the live trade
-        self.trade_kind = "breakout"  # breakout | bounce
-        self.pending = None         # (stop_pct, trail_pct, break_level, kind) at buy time
-        # discipline
+        self.closes = []      # raw price ints, as floats
+        self.highs = []
+        self.lows = []
+        self.depths = []      # effective pool depth in USDC per bar
+        self.ema_fast_hist = []
+        self.ema_slow_hist = []
+        self.vol_hist = []    # hourly vol (fraction per hour)
+        self._ema_fast = None
+        self._ema_slow = None
+        self.trade = None         # active trade dict
+        self.pending_buy = None   # buy sent last bar, awaiting fill
+        self.pending_sell = None  # sell sent last bar, awaiting fill
         self.cooldown_until = -1
-        self.blocked_until = -1
-        self.stopped = False
-        self.peak_equity = None
+        self.sitout_until = -1
+        self.pause_until = -1
+        self.halted = False
         self.loss_streak = 0
-        self.streak_block_until = -1
+        self.peak_equity = 0.0
+        self.trades_filled = 0
+        self.last_fill_bar = -10 ** 9
 
-    # -- bar ingestion ----------------------------------------------------
-    def _record_return(self, close):
-        """Append this bar's 1-minute return; keep only the last VOL_BARS."""
-        if self.prev_close is not None and self.prev_close > 0:
-            self.minute_rets.append(close / self.prev_close - 1.0)
-            if len(self.minute_rets) > CFG.VOL_BARS:
-                self.minute_rets.pop(0)
+    # -- indicators -------------------------------------------------
+    def _update_indicators(self):
+        closes = self.closes
+        n = len(closes)
+        c = closes[-1]
+        if len(closes) == EMA_FAST_N:
+            self._ema_fast = sum(closes) / EMA_FAST_N
+        elif len(closes) > EMA_FAST_N:
+            self._ema_fast += (2.0 / (EMA_FAST_N + 1)) * (c - self._ema_fast)
+        if len(closes) == EMA_SLOW_N:
+            self._ema_slow = sum(closes) / EMA_SLOW_N
+        elif len(closes) > EMA_SLOW_N:
+            self._ema_slow += (2.0 / (EMA_SLOW_N + 1)) * (c - self._ema_slow)
+        self.ema_fast_hist.append(self._ema_fast)
+        self.ema_slow_hist.append(self._ema_slow)
+        if n >= 121:
+            rets = [closes[i] / closes[i - 1] - 1.0 for i in range(n - 120, n)]
+            mean = sum(rets) / len(rets)
+            var = sum((r - mean) ** 2 for r in rets) / len(rets)
+            self.vol_hist.append(math.sqrt(var) * math.sqrt(60.0))
+        else:
+            self.vol_hist.append(None)
 
-    def _step_emas(self, close):
-        """Feed the close to both EMAs and remember the slow EMA's path."""
-        self.fast.step(float(close))
-        self.slow.step(float(close))
-        if self.slow.value is not None:
-            self.slow_ema_hist.append(self.slow.value)
-            if len(self.slow_ema_hist) > CFG.SLOW_SLOPE_BARS + 1:
-                self.slow_ema_hist.pop(0)
+    def _ret(self, idx, bars):
+        return self.closes[idx] / self.closes[idx - bars] - 1.0
 
-    def _ingest_bar(self, close):
-        """Fold one close into every indicator the strategy reads."""
-        self._record_return(close)
-        self.prev_close = close
-        self.close_hist.append(close)
-        if len(self.close_hist) > CFG.HISTORY:
-            self.close_hist.pop(0)
-        self._step_emas(close)
+    def _hourly_vol(self, idx):
+        return self.vol_hist[idx]
 
-    def _hourly_vol(self):
-        return _hourly_volatility(self.minute_rets, CFG.HOUR)
-
-    # -- sizing ------------------------------------------------------------
-    def _risk_sized_buy(self, state, hv, size_mult):
-        """Risk-based buy order; returns (order, (stop_pct, trail_pct)).
-
-        The hard stop is locked from the hourly vol at entry; the size
-        risks a fixed equity share to that stop, then scales down for thin
-        pools and for a running loss streak.
-        """
-        stop_pct = _clamp(CFG.STOP_MULT * hv, CFG.STOP_FLOOR, CFG.STOP_CAP)
-        trail_pct = _clamp(CFG.TRAIL_MULT * hv, CFG.TRAIL_FLOOR, CFG.TRAIL_CAP)
-        frac = _clamp(CFG.RISK_BUDGET / stop_pct, CFG.SIZE_MIN, CFG.SIZE_MAX) * size_mult
-        if self.loss_streak >= CFG.STREAK_HALVE:
+    # -- sizing ------------------------------------------------------
+    def _size_buy(self, state, idx, size_mult):
+        vol = self._hourly_vol(idx)
+        stop_pct = _clamp(STOP_MULT * vol, STOP_MIN, STOP_MAX)
+        frac = _clamp(RISK_BUDGET / stop_pct, POS_MIN, POS_MAX)
+        depth = self.depths[idx]
+        if depth < DEPTH_REF_USDC:
+            frac *= depth / DEPTH_REF_USDC
+        if self.loss_streak >= LOSS_HALVE_AFTER:
             frac *= 0.5
-        depth = state.depth_at(CFG.SYMBOL)
-        if depth:
-            dmin = min(depth)
-            if dmin < CFG.THIN_DEPTH:
-                frac *= dmin / CFG.THIN_DEPTH
+        frac *= size_mult
         notional = int(state.equity * frac)
-        if notional > state.cash:
-            notional = state.cash
-        min_notional = int(state.hello["fees"]["min_notional_quote_units"])
-        if notional < min_notional:
-            return None, None
-        room = state.weight_room(CFG.SYMBOL)
+        room = state.weight_room(SYMBOL)
         if notional > room:
             notional = room
-        if notional < min_notional:
-            return None, None
-        return ({"side": "buy", "symbol": CFG.SYMBOL,
-                 "notional_quote_units": notional,
-                 "max_slippage_bps": CFG.SLIP_BUY_BPS}, (stop_pct, trail_pct))
+        if notional > state.cash:
+            notional = state.cash
+        if notional < 1000000:
+            return (None, stop_pct)
+        trail_pct = _clamp(TRAIL_MULT * vol, TRAIL_MIN, TRAIL_MAX)
+        return (notional, stop_pct, trail_pct)
 
-    def _close_out(self, state, losing):
-        """Book-keeping for a closed trade: streaks, cooldown, sit-outs."""
-        if losing:
-            self.loss_streak += 1
-            if self.loss_streak >= CFG.STREAK_STOP:
-                self.streak_block_until = state.seq + CFG.STREAK_STOP_BARS
-                self.loss_streak = 0
+    # -- entry checks -------------------------------------------------
+    def _breakout_ok(self, idx, need_vol):
+        closes = self.closes
+        close = closes[idx]
+        high60 = max(self.highs[idx - BREAKOUT_BARS:idx])
+        if close < high60 * (1.0 + BREAKOUT_MARGIN):
+            return None
+        ema_slow = self.ema_slow_hist[idx]
+        if close <= ema_slow:
+            return None
+        if ema_slow < self.ema_slow_hist[idx - 60]:
+            return None
+        if self._ret(idx, 30) < RET_FAST_MIN:
+            return None
+        if self._ret(idx, 60) > RET_MID_MAX:
+            return None
+        if idx >= 240 and self._ret(idx, 240) > RET_LONG_MAX:
+            return None
+        if close > self.ema_fast_hist[idx] * (1.0 + EXT_MAX):
+            return None
+        if need_vol:
+            vol = self._hourly_vol(idx)
+            vol_ago = self._hourly_vol(idx - 60)
+            if vol is None or vol_ago is None or vol_ago <= 0.0:
+                return None
+            if vol < VOL_EXPAND * vol_ago:
+                return None
+            if vol < VOL_MIN or vol > VOL_MAX:
+                return None
+        fresh = False
+        for j in range(max(idx - FRESH_BARS, EMA_SLOW_N - 1), idx + 1):
+            if self.ema_slow_hist[j] is not None and closes[j] <= self.ema_slow_hist[j]:
+                fresh = True
+                break
+        if not fresh and idx - self.last_fill_bar > FRESH_BARS:
+            return None
+        return high60
+
+    def _bounce_ok(self, idx):
+        close = self.closes[idx]
+        if self._ret(idx, 60) > BOUNCE_DIP:
+            return False
+        low30 = min(self.lows[idx - 30:idx])
+        if close < low30 * (1.0 + BOUNCE_RECOVER):
+            return False
+        if self._ret(idx, 15) < BOUNCE_FAST_MIN:
+            return False
+        if close >= self.ema_slow_hist[idx]:
+            return False
+        return True
+
+    # -- main callback -------------------------------------------------
+    def on_batch(self, state, batch):
+        bar = state.latest.get(SYMBOL)
+        if bar is None:
+            return []
+        idx = len(self.closes)
+        self.closes.append(float(int(bar["c"])))
+        self.highs.append(float(int(bar["h"])))
+        self.lows.append(float(int(bar["l"])))
+        depth = state.depth_at(SYMBOL)
+        if depth:
+            total = 0.0
+            for d in depth:
+                total += 1.0 / d
+            eff = 1.0 / total if total > 0.0 else 0.0
+            self.depths.append(eff / (10 ** state.hello["capital"]["quote_scale"]))
         else:
-            self.loss_streak = 0
-        self.cooldown_until = state.seq + (CFG.COOLDOWN_LOSS if losing else CFG.COOLDOWN_WIN)
-        self.last_trade_seq = state.seq
-        self.entry_bar = -1
-        self.peak_position_value = 0
-        self.trade_kind = "breakout"
+            self.depths.append(0.0)
+        self._update_indicators()
 
-    # -- per-bar bookkeeping ------------------------------------------------
-    def _track_equity_peak(self, state):
-        """Peak equity starts at the race capital and only ever rises."""
-        if self.peak_equity is None:
-            self.peak_equity = int(state.hello["capital"]["quote_units"])
+        holding = state.positions.get(SYMBOL)
+
+        # Resolve last bar's pending orders from this batch's account.
+        if self.pending_buy is not None:
+            if holding is not None:
+                self._activate_trade(state, idx, holding)
+            self.pending_buy = None
+        if self.pending_sell is not None:
+            won = self.pending_sell["won"]
+            guard = self.pending_sell["guard"]
+            self.pending_sell = None
+            if holding is None:
+                self._finalize_exit(idx, won, guard)
+            # else the sell was rejected: the trade stays live and the
+            # exit checks below will fire again next bar.
+
         if state.equity > self.peak_equity:
             self.peak_equity = state.equity
 
-    def _track_regime(self, state, held, seq):
-        """Remember when price last sat at/under EMA(120), and last traded.
+        # Equity drawdown guard: close and pause / halt entries.
+        guard = None
+        if self.trade is not None and self.peak_equity > 0:
+            if state.equity <= self.peak_equity * (1.0 - DD_HALT):
+                guard = "halt"
+            elif state.equity <= self.peak_equity * (1.0 - DD_PAUSE):
+                guard = "pause"
 
-        The first bar with a slow EMA is treated as fresh (regime age
-        unknown), so an early breakout is not vetoed for stale history.
-        """
-        if self.slow.value is not None:
-            if self.last_below_slow_seq is None:
-                self.last_below_slow_seq = seq   # regime age unknown: call it fresh
-            elif self.prev_close is not None and float(self.prev_close) <= self.slow.value:
-                self.last_below_slow_seq = seq
-        if held is not None and held.qty > 0:
-            self.last_trade_seq = seq
+        if self.trade is not None:
+            order = self._exit_order(state, idx, guard)
+            if order is not None:
+                return order
+            return []
 
-    def _drawdown_guard(self, state, seq):
-        """Equity drawdown guard; returns (entries blocked, close now).
+        if state.warming_up:
+            return []
+        if idx < MIN_HISTORY:
+            return []
+        if self.halted or idx < self.pause_until:
+            return []
+        if idx < self.cooldown_until or idx < self.sitout_until:
+            return []
 
-        At -9% from peak: close the position and pause entries 4 hours.
-        At -15%: close and stop entering for the rest of the race.
-        """
-        dd_blocked = self.stopped or seq < self.blocked_until
-        dd_close = self.stopped
-        if self.peak_equity > 0:
-            dd = 1.0 - state.equity / self.peak_equity
-            if dd >= CFG.DD_STOP:
-                self.stopped = True
-                dd_blocked = True
-                dd_close = True
-            elif dd >= CFG.DD_PAUSE and seq >= self.blocked_until:
-                self.blocked_until = seq + CFG.DD_PAUSE_BARS
-                dd_blocked = True
-                dd_close = True
-        return dd_blocked, dd_close
-
-    # -- exits ---------------------------------------------------------------
-    def _note_fill(self, state, held, seq):
-        """First sight of a filled buy: lock the entry bar and its stops."""
-        self.entry_bar = seq
-        self.fills_seen += 1
-        self.peak_position_value = state.value(CFG.SYMBOL, held.qty)
-        if self.pending is not None:
-            self.stop_pct, self.trail_pct, self.break_level, self.trade_kind = self.pending
-            self.pending = None
-
-    def _exit_triggered(self, value, cost, close, held_bars, trend_down, dd_close):
-        """Every exit rule, in the order they are checked.
-
-        Drawdown guard, hard stop, trailing stop, failed breakout/bounce,
-        trend break, bounce take-profit, bounce time stop, dead-trade time
-        stop. First hit wins; all of them sell the whole position.
-        """
-        if dd_close:
-            return True                     # drawdown guard
-        if value <= cost * (1.0 - self.stop_pct):
-            return True                     # hard stop
-        if (self.peak_position_value >= cost * CFG.TRAIL_ARM
-                and value <= self.peak_position_value * (1.0 - self.trail_pct)):
-            return True                     # trailing stop
-        if (held_bars >= CFG.MIN_HOLD_BREAKOUT and self.break_level > 0
-                and close is not None and close < self.break_level):
-            return True                     # failed breakout / bounce
-        if held_bars >= CFG.MIN_HOLD_SOFT and trend_down:
-            return True                     # trend break
-        if (self.trade_kind == "bounce" and CFG.BOUNCE_TP > 0
-                and value >= cost * (1.0 + CFG.BOUNCE_TP)):
-            return True                     # bounce take-profit
-        if (self.trade_kind == "bounce" and held_bars >= CFG.BOUNCE_TIME_BARS
-                and value < cost * CFG.TIME_STOP_MAX_GAIN):
-            return True                     # bounce time stop (2h)
-        if (self.trade_kind != "bounce" and held_bars >= CFG.TIME_STOP_BARS
-                and value < cost * CFG.TIME_STOP_MAX_GAIN):
-            return True                     # dead trade
-        return False
-
-    def _manage_position(self, state, held, seq, trend_down, dd_close):
-        """Watch the live position; sell it whole when any exit fires.
-
-        Returns [sell order] on an exit, [] while still holding, and is
-        only called when a position is actually held.
-        """
-        if self.entry_bar < 0:
-            # position appeared (the buy sent earlier filled at this open)
-            self._note_fill(state, held, seq)
-        value = state.value(CFG.SYMBOL, held.qty)
-        if value > self.peak_position_value:
-            self.peak_position_value = value
-        cost = held.cost
-        close = state.close(CFG.SYMBOL)
-        held_bars = seq - self.entry_bar
-        if self._exit_triggered(value, cost, close, held_bars, trend_down, dd_close):
-            self._close_out(state, value < cost)
-            return [{"side": "sell", "symbol": CFG.SYMBOL, "qty": held.qty,
-                     "max_slippage_bps": CFG.SLIP_SELL_BPS}]
+        # Breakout first; bounce only when it declines.
+        breakout_level = self._breakout_ok(idx, need_vol=True)
+        size_mult = 1.0
+        if breakout_level is None and self.trades_filled == 0 and idx >= FALLBACK_BAR:
+            breakout_level = self._breakout_ok(idx, need_vol=False)
+            if breakout_level is not None:
+                size_mult = 0.5
+        if breakout_level is not None:
+            sized = self._size_buy(state, idx, size_mult)
+            if sized[0] is None:
+                return []
+            notional, stop_pct, trail_pct = sized
+            self.pending_buy = {
+                "stop_pct": stop_pct,
+                "trail_pct": trail_pct,
+                "breakout_level": breakout_level,
+                "mode": "breakout",
+                "decision_close": self.closes[idx],
+            }
+            return [{"side": "buy", "symbol": SYMBOL,
+                     "notional_quote_units": notional,
+                     "max_slippage_bps": BUY_SLIP_BPS}]
+        if self._bounce_ok(idx):
+            sized = self._size_buy(state, idx, BOUNCE_SIZE)
+            if sized[0] is None:
+                return []
+            notional, stop_pct, trail_pct = sized
+            self.pending_buy = {
+                "stop_pct": stop_pct,
+                "trail_pct": trail_pct,
+                "breakout_level": None,
+                "mode": "bounce",
+                "decision_close": self.closes[idx],
+            }
+            return [{"side": "buy", "symbol": SYMBOL,
+                     "notional_quote_units": notional,
+                     "max_slippage_bps": BUY_SLIP_BPS}]
         return []
 
-    # -- entries --------------------------------------------------------------
-    def _breakout_entry(self, state, hv, close, seq):
-        """Mode A: the prepared breakout rider, unchanged.
+    def _activate_trade(self, state, idx, holding):
+        cap = state.hello["capital"]
+        price = (holding.cost * 10 ** (state.symbols[SYMBOL]["qty_scale"]
+                                       + state.symbols[SYMBOL]["price_scale"])
+                 / (holding.qty * 10 ** cap["quote_scale"]))
+        if price <= 0:
+            price = self.pending_buy["decision_close"]
+        self.trade = {
+            "entry_price": price,
+            "stop_pct": self.pending_buy["stop_pct"],
+            "trail_pct": self.pending_buy["trail_pct"],
+            "breakout_level": self.pending_buy["breakout_level"],
+            "mode": self.pending_buy["mode"],
+            "entry_bar": idx,
+            "peak": price,
+            "armed": False,
+        }
+        self.trades_filled += 1
+        self.last_fill_bar = idx
 
-        Every filter must agree: fresh high with margin, non-falling
-        market, force without blow-off, no overextension, fresh regime,
-        expanding volatility — with one late-race fallback for a bot
-        still tradeless at bar 900.
-        """
-        if float(close) <= self.slow.value:
-            return None                               # falling market context
-        if len(self.slow_ema_hist) > CFG.SLOW_SLOPE_BARS:
-            if self.slow_ema_hist[-1] < self.slow_ema_hist[0] * (1.0 + CFG.SLOW_SLOPE_MIN):
-                return None                           # slow EMA falling
-        break_level = max(self.close_hist[-CFG.BREAKOUT_BARS - 1:-1])
-        if close < break_level * (1.0 + CFG.BREAKOUT_MARGIN):
-            return None                               # no decisive fresh breakout
-        ret_fast = _trailing_return(self.close_hist, CFG.RET_FAST_BARS)
-        ret_slow = _trailing_return(self.close_hist, CFG.RET_SLOW_BARS)
-        ret_long = _trailing_return(self.close_hist, CFG.RET_LONG_BARS)
-        if ret_fast is None or ret_fast < CFG.RET_FAST_MIN:
-            return None                               # breakout without force
-        if ret_slow is not None and ret_slow > CFG.RET_SLOW_MAX:
-            return None                               # vertical blow-off: spent
-        if ret_long is not None and ret_long > CFG.RET_LONG_MAX:
-            return None                               # 4-hour move already extended
-        if float(close) > self.fast.value * (1.0 + CFG.EXT_MAX):
-            return None                               # overextended above the fast EMA
-        fresh_regime = (self.last_below_slow_seq is not None
-                        and seq - self.last_below_slow_seq <= CFG.FRESH_BARS)
-        if not fresh_regime and seq - self.last_trade_seq > CFG.FRESH_BARS:
-            return None                               # mature regime: range top
-        expanding = (len(self.vol_hist) > CFG.SLOW_SLOPE_BARS
-                     and self.vol_hist[-1] >= CFG.VOL_EXPAND * self.vol_hist[-CFG.SLOW_SLOPE_BARS - 1])
-        fallback = False
-        if not expanding:
-            if (not self.fallback_used and self.fills_seen == 0
-                    and seq >= CFG.FALLBACK_SEQ):
-                fallback = True     # late and tradeless: take it small
-            else:
-                return None           # quiet breakout: ranges reject these
-        order, pending = self._risk_sized_buy(state, hv, 1.0)
-        if order is None:
+    def _finalize_exit(self, idx, won, guard):
+        self.trade = None
+        if guard == "pause":
+            self.pause_until = idx + DD_PAUSE_BARS
+        elif guard == "halt":
+            self.halted = True
+        if won:
+            self.loss_streak = 0
+            self.cooldown_until = idx + COOLDOWN_WIN
+        else:
+            self.loss_streak += 1
+            self.cooldown_until = idx + COOLDOWN_LOSS
+            if self.loss_streak >= LOSS_SITOUT_AFTER:
+                self.sitout_until = idx + SITOUT_BARS
+
+    def _exit_order(self, state, idx, guard):
+        trade = self.trade
+        holding = state.positions.get(SYMBOL)
+        if holding is None:
+            self.trade = None
             return None
-        if fallback:
-            order = dict(order)
-            order["notional_quote_units"] = max(
-                int(state.hello["fees"]["min_notional_quote_units"]),
-                int(order["notional_quote_units"] * CFG.FALLBACK_SIZE))
-            self.fallback_used = True
-        stop_pct, trail_pct = pending
-        self.pending = (stop_pct, trail_pct, break_level, "breakout")
-        return order
-
-    def _bounce_entry(self, state, hv, close, seq):
-        """Mode B: counter-trend dip-recovery bounce (price under EMA(120)).
-
-        Only tried after the breakout mode declines. It buys the confirmed
-        turn off the 30-bar low after a sharp hourly dip — a bounce, not a
-        falling knife.
-        """
-        if float(close) >= self.slow.value:
-            return None           # above the slow EMA: the breakout mode owns it
-        dip = _trailing_return(self.close_hist, CFG.BOUNCE_DIP_BARS)
-        if dip is None or dip > -CFG.BOUNCE_DIP_MIN:
-            return None           # no real dip in the last hour
-        low = min(self.close_hist[-CFG.BOUNCE_LOW_BARS:])
-        if float(close) < low * (1.0 + CFG.BOUNCE_RECOVER):
-            return None           # not yet recovered off the low: falling knife
-        mom = _trailing_return(self.close_hist, CFG.BOUNCE_MOM_BARS)
-        if mom is None or mom < CFG.BOUNCE_MOM_MIN:
-            return None           # short-term momentum has not turned up
-        if float(close) > self.fast.value * (1.0 + CFG.EXT_MAX):
-            return None           # overextended above the fast EMA
-        order, pending = self._risk_sized_buy(state, hv, CFG.BOUNCE_SIZE)
-        if order is None:
+        close = self.closes[idx]
+        entry = trade["entry_price"]
+        held = idx - trade["entry_bar"]
+        if close > trade["peak"]:
+            trade["peak"] = close
+        if close >= entry * (1.0 + TRAIL_ARM):
+            trade["armed"] = True
+        fire = False
+        if guard is not None:
+            fire = True
+        elif close <= entry * (1.0 - trade["stop_pct"]):
+            fire = True
+        elif trade["armed"] and close <= trade["peak"] * (1.0 - trade["trail_pct"]):
+            fire = True
+        elif (trade["mode"] == "breakout" and held >= FAILED_AFTER
+                and trade["breakout_level"] is not None
+                and close < trade["breakout_level"]):
+            fire = True
+        elif (held >= TREND_AFTER
+                and self.ema_fast_hist[idx] is not None
+                and self.ema_fast_hist[idx] < self.ema_slow_hist[idx]):
+            fire = True
+        elif held >= TIME_STOP_BARS and close < entry * (1.0 + TIME_STOP_MIN):
+            fire = True
+        elif trade["mode"] == "bounce" and close >= entry * (1.0 + BOUNCE_TP):
+            fire = True
+        elif (trade["mode"] == "bounce" and held >= BOUNCE_TIME_BARS
+                and close < entry * (1.0 + TIME_STOP_MIN)):
+            fire = True
+        if not fire:
             return None
-        stop_pct, trail_pct = pending
-        self.pending = (stop_pct, trail_pct, low, "bounce")
-        return order
-
-    def _try_entries(self, state, hv, seq, dd_blocked):
-        """Flat and unblocked: try the breakout mode, then the bounce."""
-        if dd_blocked or seq < self.cooldown_until or seq < self.streak_block_until:
-            return []
-        if hv is None:
-            return []
-        if not (CFG.VOL_MIN_HOURLY <= hv <= CFG.VOL_MAX_HOURLY):
-            return []
-        if len(self.close_hist) < CFG.BREAKOUT_BARS + 1:
-            return []
-        close = state.close(CFG.SYMBOL)
-        if close is None or self.slow.value is None or self.fast.value is None:
-            return []
-
-        order = self._breakout_entry(state, hv, close, seq)
-        if order is not None:
-            return [order]
-        order = self._bounce_entry(state, hv, close, seq)
-        if order is not None:
-            return [order]
-        return []
-
-    # -- main ------------------------------------------------------------------
-    def on_batch(self, state, batch):
-        fresh = False
-        for bar in batch["bars"]:
-            if bar["symbol"] == CFG.SYMBOL:
-                self._ingest_bar(int(bar["c"]))
-                fresh = True
-        hv = self._hourly_vol()
-        if fresh and hv is not None:
-            self.vol_hist.append(hv)
-            if len(self.vol_hist) > CFG.SLOW_SLOPE_BARS + 1:
-                self.vol_hist.pop(0)
-        if not fresh or state.warming_up:
-            return []
-
-        self._track_equity_peak(state)
-        held = state.positions.get(CFG.SYMBOL)
-        seq = state.seq
-        self._track_regime(state, held, seq)
-        trend_down = (self.fast.value is not None and self.slow.value is not None
-                      and self.fast.value < self.slow.value)
-        dd_blocked, dd_close = self._drawdown_guard(state, seq)
-
-        if held is not None and held.qty > 0:
-            return self._manage_position(state, held, seq, trend_down, dd_close)
-
-        # flat: forget stale position state
-        if self.entry_bar >= 0:
-            self.entry_bar = -1
-            self.peak_position_value = 0
-
-        return self._try_entries(state, hv, seq, dd_blocked)
-
-
-_strategy = Strategy()
+        won = state.value(SYMBOL, holding.qty) >= holding.cost
+        self.pending_sell = {"won": won, "guard": guard}
+        return [{"side": "sell", "symbol": SYMBOL, "qty": holding.qty,
+                 "max_slippage_bps": SELL_SLIP_BPS}]
 
 
 def on_batch(state, batch):
-    return _strategy.on_batch(state, batch)
+    return _BOT.on_batch(state, batch)
 
 
-if __name__ == "__main__":
-    makefun_bars.run(on_batch)
+_BOT = Bot()
+
+makefun_bars.run(on_batch)
